@@ -1,34 +1,107 @@
 package gridfs
 
 import (
+	"bufio"
+	"crypto/md5"
 	"errors"
 	"io"
+	"log"
+	"math"
 	"os"
-
-	"go.mongodb.org/mongo-driver/mongo"
+	"time"
 )
 
-func newFile(fileInfo *FileInfo, chunksColl, filesColl, tempsColl *mongo.Collection) *File {
-	return &File{
-		name:     fileInfo.Filename,
-		stream:   newStream(fileInfo, chunksColl, filesColl, tempsColl),
-		fileInfo: fileInfo,
-	}
+// File represents an open file descriptor.
+type File struct {
+	*stream // gridfs file stream specific
 }
 
-// Name returns the name of the file as presented to Open.
-func (f *File) Name() string { return f.name }
+// FileInfo represents an database file descriptor.
+type FileInfo struct {
+	nonblock    bool // whether we set nonblocking mode
+	stdoutOrErr bool // whether this is stdout or stderr
+	appendMode  bool // whether file is opened for appending
+
+	ID         interface{}    `bson:"_id"`
+	ChunkSize  int32          `bson:"chunkSize"`
+	Filename   string         `bson:"filename"`
+	Length     int64          `bson:"length"`
+	Metadata   interface{}    `bson:"metadata"`
+	Reference  *FileReference `bson:"reference,omitempty"`
+	UploadDate time.Time      `bson:"uploadDate"`
+}
+
+// FileReference represents an database file reference.
+type FileReference struct {
+	Hashes               Hashes    `bson:"hashes,omitempty"`
+	MimeType             string    `bson:"mimeType,omitempty"`
+	CreatedDateTime      time.Time `bson:"createdDateTime,omitempty"`
+	LastAccessedDateTime time.Time `bson:"lastAccessedDateTime,omitempty"`
+	LastModifiedDateTime time.Time `bson:"lastModifiedDateTime,omitempty"`
+}
+
+// Hashes represents an database file reference.
+type Hashes struct {
+	MD5Hash      *string `bson:"md5Hash,omitempty"`      // hex
+	CRC32Hash    *string `bson:"crc32Hash,omitempty"`    // hex
+	SHA1Hash     *string `bson:"sha1Hash,omitempty"`     // hex
+	QuickXorHash *string `bson:"quickXorHash,omitempty"` // base64
+}
+
+func (f *File) MD5Hash() (md5Hash *string, err error) {
+	if err := f.checkValid("MD5Hash"); err != nil {
+		return nil, err
+	}
+	if f.stream.fileInfo.Reference != nil {
+		md5Hash = f.stream.fileInfo.Reference.Hashes.MD5Hash
+	} else {
+		f.stream.fileInfo.Reference = &FileReference{Hashes: Hashes{}}
+	}
+	if md5Hash == nil {
+		_, err = f.Seek(0, io.SeekStart)
+		if err != nil {
+			return
+		}
+		f.stream.numChunks = int32(math.Ceil(float64(f.stream.fileInfo.Length) / float64(f.stream.fileInfo.ChunkSize)))
+		r := bufio.NewReader(f)
+		h := md5.New()
+		if _, err := io.Copy(h, r); err != nil {
+			log.Println(err)
+		}
+		hSum := string(h.Sum(nil))
+		f.stream.fileInfo.Reference.Hashes.MD5Hash = &hSum
+		log.Printf("%x %s", md5Hash, f.fileInfo.Filename)
+	}
+	if e := f.stream.close(); e != nil {
+		err = f.wrapErr("close", e)
+	}
+	return
+}
 
 // Close closes the File, rendering it unusable for I/O.
 // On files that support SetDeadline, any pending I/O operations will
 // be canceled and return immediately with an error.
 // Close will return an error if it has already been called.
 func (f *File) Close() (err error) {
-	if f == nil {
-		err = os.ErrInvalid
+	if err := f.checkValid("Close"); err != nil {
+		return err
+	}
+	ctx, cancel := deadlineContext(f.stream.writeDeadline)
+	if cancel != nil {
+		defer cancel()
+	}
+	if f.stream.flag&StreamModified != 0 {
+		err := f.stream.writeChunks(ctx, true)
+		if err != nil {
+			return err
+		}
+		f.stream.flag = f.stream.flag &^ StreamModified
+	}
+	if err := f.stream.createFilesCollDoc(ctx); err != nil {
+		return err
 	}
 	if e := f.stream.close(); e != nil {
-		err = &os.PathError{Op: "close", Path: f.name, Err: e}
+		err = f.wrapErr("close", e)
 	}
 	return
 }
@@ -40,7 +113,7 @@ func (f *File) Read(b []byte) (n int, err error) {
 	if err := f.checkValid("read"); err != nil {
 		return 0, err
 	}
-	n, e := f.stream.read(b)
+	n, e := f.read(b)
 	return n, f.wrapErr("read", e)
 }
 
@@ -54,7 +127,7 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	}
 
 	if off < 0 {
-		return 0, &os.PathError{Op: "readat", Path: f.name, Err: errors.New("negative offset")}
+		return 0, f.wrapErr("readat", errors.New("negative offset"))
 	}
 
 	for len(b) > 0 {
@@ -77,7 +150,7 @@ func (f *File) Write(b []byte) (n int, err error) {
 	if err := f.checkValid("write"); err != nil {
 		return 0, err
 	}
-	n, e := f.stream.write(b)
+	n, e := f.write(b)
 	if n < 0 {
 		n = 0
 	}
@@ -105,12 +178,12 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	if err := f.checkValid("write"); err != nil {
 		return 0, err
 	}
-	if f.appendMode {
-		return 0, errWriteAtInAppendMode
-	}
+	// if f.appendMode {
+	// 	return 0, errWriteAtInAppendMode
+	// }
 
 	if off < 0 {
-		return 0, &os.PathError{Op: "writeat", Path: f.name, Err: errors.New("negative offset")}
+		return 0, f.wrapErr("writeat", errors.New("negative offset"))
 	}
 
 	for len(b) > 0 {
@@ -135,17 +208,52 @@ func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	if err := f.checkValid("seek"); err != nil {
 		return 0, err
 	}
-	r, e := f.stream.seek(offset, whence)
+	r, e := f.seek(offset, whence)
 	if e != nil {
 		return 0, f.wrapErr("seek", e)
 	}
 	return r, nil
 }
 
+// WriteString is like Write, but writes the contents of string s rather than
+// a slice of bytes.
+func (f *File) WriteString(s string) (n int, err error) {
+	return f.Write([]byte(s))
+}
+
+func (f *File) readdir(n int) (fi []FileInfo, err error) {
+	panic("v")
+}
+
+// setDeadline sets the read and write deadline.
+func (f *File) setDeadline(t time.Time) error {
+	if err := f.checkValid("SetDeadline"); err != nil {
+		return err
+	}
+	return f.stream.setDeadline(t)
+}
+
+// setReadDeadline sets the read deadline.
+func (f *File) setReadDeadline(t time.Time) error {
+	if err := f.checkValid("SetReadDeadline"); err != nil {
+		return err
+	}
+	return f.stream.setReadDeadline(t)
+}
+
+// setWriteDeadline sets the write deadline.
+func (f *File) setWriteDeadline(t time.Time) error {
+	if err := f.checkValid("SetWriteDeadline"); err != nil {
+		return err
+	}
+	return f.stream.setWriteDeadline(t)
+}
+
+// checkValid checks whether f is valid for use.
 // If not, it returns an appropriate error, perhaps incorporating the operation name op.
 func (f *File) checkValid(op string) error {
 	if f == nil {
-		return os.ErrInvalid
+		return ErrFileInvalid
 	}
 	return nil
 }
@@ -160,9 +268,5 @@ func (f *File) wrapErr(op string, err error) error {
 	// if err == poll.ErrFileClosing {
 	// 	err = os.ErrClosed
 	// }
-	return &os.PathError{Op: op, Path: f.name, Err: err}
-}
-
-func (i *FileInfo) Revision() *int32 {
-	return nil
+	return &os.PathError{Op: op, Path: f.stream.fileInfo.Filename, Err: err}
 }

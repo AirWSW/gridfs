@@ -1,21 +1,13 @@
-package gridfs
+package old
 
 import (
 	"io"
-	"os"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/bsonx"
-)
-
-const (
-	// DefaultBucketName is the default name of bucket.
-	DefaultBucketName string = "fs"
-	// DefaultChunkSize is the default size of each file chunk.
-	DefaultChunkSize int32 = 255 * 1024 // 255KiB
 )
 
 // NewBucket creates a GridFS bucket.
@@ -66,7 +58,7 @@ func (b *Bucket) OpenUploadStreamWithID(fileID interface{}, filename string, opt
 	if err != nil {
 		return nil, err
 	}
-	return b.newFile(fileInfo, os.O_RDWR|os.O_CREATE|os.O_TRUNC), nil
+	return b.CreateWithID(filename, fileID, fileInfo)
 }
 
 // UploadFromStream creates a fileID and uploads a file given a source stream.
@@ -77,11 +69,11 @@ func (b *Bucket) UploadFromStream(filename string, source io.Reader, opts ...*op
 
 // UploadFromStreamWithID uploads a file given a source stream.
 func (b *Bucket) UploadFromStreamWithID(fileID interface{}, filename string, source io.Reader, opts ...*options.UploadOptions) error {
-	file, err := b.OpenUploadStreamWithID(fileID, filename, opts...)
+	us, err := b.OpenUploadStreamWithID(fileID, filename, opts...)
 	if err != nil {
 		return err
 	}
-	return b.uploadFromStream(file, source)
+	return b.uploadFromStream(us, source)
 }
 
 // OpenDownloadStream creates a stream from which the contents of the file can be read and seek.
@@ -100,7 +92,7 @@ func (b *Bucket) OpenDownloadStream(fileID interface{}) (*File, error) {
 		return nil, err
 	}
 
-	return b.newFile(&fileInfo, os.O_RDONLY), nil
+	return newFile(&fileInfo, b.chunksColl, b.filesColl, b.tempsColl), nil
 }
 
 // OpenDownloadStreamByName opens a download stream for the file with the given filename.
@@ -119,26 +111,26 @@ func (b *Bucket) OpenDownloadStreamByName(filename string, opts ...*options.Name
 		return nil, err
 	}
 
-	return b.newFile(&fileInfo, os.O_RDONLY), nil
+	return newFile(&fileInfo, b.chunksColl, b.filesColl, b.tempsColl), nil
 }
 
 // DownloadToStream downloads the file with the specified fileID and writes it to the provided io.Writer.
 // Returns the number of bytes written to the steam and an error, or nil if there was no error.
 func (b *Bucket) DownloadToStream(fileID interface{}, stream io.Writer) (int64, error) {
-	file, err := b.OpenDownloadStream(fileID)
+	ds, err := b.OpenDownloadStream(fileID)
 	if err != nil {
 		return 0, err
 	}
-	return b.downloadToStream(file, stream)
+	return b.downloadToStream(ds, stream)
 }
 
 // DownloadToStreamByName downloads the file with the given name to the given io.Writer.
 func (b *Bucket) DownloadToStreamByName(filename string, stream io.Writer, opts ...*options.NameOptions) (int64, error) {
-	file, err := b.OpenDownloadStreamByName(filename, opts...)
+	ds, err := b.OpenDownloadStreamByName(filename, opts...)
 	if err != nil {
 		return 0, err
 	}
-	return b.downloadToStream(file, stream)
+	return b.downloadToStream(ds, stream)
 }
 
 func (b *Bucket) parseUploadOptions(fileID interface{}, filename string, opts ...*options.UploadOptions) (*FileInfo, error) {

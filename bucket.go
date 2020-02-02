@@ -3,236 +3,38 @@ package gridfs
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
+	"runtime"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/x/bsonx"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 )
 
-// Create creates or truncates the named file. If the file already exists,
-// it is truncated. If the file does not exist, it is created with mode 0666
-// (before umask). If successful, methods on the returned File can
-// be used for I/O; the associated file descriptor has mode O_RDWR.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) Create(name string, fileInfo *FileInfo) (*File, error) {
-	if fileInfo != nil && fileInfo.Filename != name {
-		return nil, errors.New("text")
-	} else if fileInfo == nil {
-		fileInfo = &FileInfo{
-			ID:       primitive.NewObjectID(),
-			Filename: name,
-		}
-	}
-	return b.OpenFile(fileInfo, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-}
+// Bucket represents a GridFS bucket.
+type Bucket struct {
+	name      string // The bucket name. Defaults to "fs".
+	chunkSize int32  // The bucket chunk size in bytes. Defaults to 255KiB.
+	created   bool   // The bucket created. Defaults to false.
 
-// CreateWithID creates or truncates the named file. If the file already exists,
-// it is truncated. If the file does not exist, it is created with mode 0666
-// (before umask). If successful, methods on the returned File can
-// be used for I/O; the associated file descriptor has mode O_RDWR.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) CreateWithID(name string, fileID interface{}, fileInfo *FileInfo) (*File, error) {
-	if fileInfo != nil && (fileInfo.ID != fileID || fileInfo.Filename != name) {
-		return nil, errors.New("text")
-	} else if fileInfo == nil {
-		fileInfo = &FileInfo{
-			ID:       fileID,
-			Filename: name,
-		}
-	}
-	return b.OpenFile(fileInfo, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-}
+	db *mongo.Database            // The database for the bucket.
+	wc *writeconcern.WriteConcern // The write concern for the bucket. Defaults to the write concern of the database.
+	rc *readconcern.ReadConcern   // The read concern for the bucket. Defaults to the read concern of the database.
+	rp *readpref.ReadPref         // The read preference for the bucket. Defaults to the read preference of the database.
 
-// Open opens the named file for reading. If successful, methods on
-// the returned file can be used for reading; the associated file
-// descriptor has mode O_RDONLY.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) Open(fileID interface{}, fileInfo *FileInfo) (*File, error) {
-	if fileInfo != nil && fileInfo.ID != fileID {
-		return nil, errors.New("text")
-	} else if fileInfo == nil {
-		fileInfo = &FileInfo{
-			ID: fileID,
-		}
-	}
-	return b.OpenFile(fileInfo, os.O_RDONLY, 0)
-}
+	chunksColl *mongo.Collection // The collection to store file chunks.
+	filesColl  *mongo.Collection // The collection to store file metadata.
+	tempsColl  *mongo.Collection // The collection to store file temps.
 
-// OpenByName opens the named file for reading. If successful, methods on
-// the returned file can be used for reading; the associated file
-// descriptor has mode O_RDONLY.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) OpenByName(name string, fileInfo *FileInfo) (*File, error) {
-	if fileInfo != nil && fileInfo.Filename != name {
-		return nil, errors.New("text")
-	} else if fileInfo == nil {
-		fileInfo = &FileInfo{
-			Filename: name,
-		}
-	}
-	return b.OpenFile(fileInfo, os.O_RDONLY, 0)
-}
-
-// OpenFile is the generalized open call; most users will use Open
-// or Create instead. It opens the named file with specified flag
-// (O_RDONLY etc.). If the file does not exist, and the O_CREATE flag
-// is passed, it is created with mode perm (before umask). If successful,
-// methods on the returned File can be used for I/O.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) OpenFile(fileInfo *FileInfo, flag int, perm os.FileMode) (*File, error) {
-	ctx, cancel := deadlineContext(b.openDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-
-	if err := b.checkIndexesCreated(ctx); err != nil {
-		return nil, err
-	}
-
-	f, err := b.openFile(ctx, fileInfo, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-
-	f.appendMode = flag&os.O_APPEND != 0
-
-	return f, nil
-}
-
-func (b *Bucket) Hash() {
-	// f.stream.closed = false
-	// _, err = f.Seek(0, io.SeekStart)
-	// if err != nil {
-	// 	return
-	// }
-	// f.stream.numChunks = int32(math.Ceil(float64(f.stream.fileInfo.Length) / float64(f.stream.fileInfo.ChunkSize)))
-	// r := bufio.NewReader(f)
-	// h := md5.New()
-	// if _, err := io.Copy(h, r); err != nil {
-	// 	log.Println(err)
-	// }
-	// log.Printf("%x %s", h.Sum(nil), f.name)
-	// f.stream.closed = true
-}
-
-// Pipe returns a connected pair of Files; reads from r return bytes written to w.
-// It returns the files and an error, if any.
-func (b *Bucket) Pipe() (r *File, w *File, err error) {
-	panic("not implemented")
-}
-
-// Remove removes the named file or directory.
-// If there is an error, it will be of type *PathError.
-func (b *Bucket) Remove(fileID interface{}) error {
-	return b.Delete(fileID)
-}
-
-// Rename renames oldpath to newpath.
-// If newpath already exists and is not a directory, Rename replaces it.
-// OS-specific restrictions may apply when oldpath and newpath are in different directories.
-// If there is an error, it will be of type *LinkError.
-func (b *Bucket) Rename(fileID interface{}, newFilename string) error {
-	ctx, cancel := deadlineContext(b.writeDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-
-	id, err := convertFileID(fileID)
-	if err != nil {
-		return err
-	}
-	res, err := b.filesColl.UpdateOne(ctx,
-		bsonx.Doc{bsonx.Elem{Key: "_id", Value: id}},
-		bsonx.Doc{bsonx.Elem{Key: "$set", Value: bsonx.Document(bsonx.Doc{bsonx.Elem{Key: "filename", Value: bsonx.String(newFilename)}})}},
-	)
-	if err != nil {
-		return err
-	}
-
-	if res.MatchedCount == 0 {
-		return ErrFileNotFound
-	}
-
-	return nil
-}
-
-// Delete deletes all chunks and metadata associated with the file with the given file ID.
-func (b *Bucket) Delete(fileID interface{}) error {
-	ctx, cancel := deadlineContext(b.writeDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-
-	id, err := convertFileID(fileID)
-	if err != nil {
-		return err
-	}
-	res, err := b.filesColl.DeleteOne(ctx, bsonx.Doc{bsonx.Elem{Key: "_id", Value: id}})
-	if err == nil && res.DeletedCount == 0 {
-		err = ErrFileNotFound
-	}
-	if err != nil {
-		_ = b.deleteChunks(ctx, fileID) // can attempt to delete chunks even if no docs in files collection matched
-		return err
-	}
-
-	return b.deleteChunks(ctx, fileID)
-}
-
-// Drop drops the files and chunks collections associated with this bucket.
-func (b *Bucket) Drop() error {
-	ctx, cancel := deadlineContext(b.writeDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-
-	if err := b.filesColl.Drop(ctx); err != nil {
-		return err
-	}
-
-	if err := b.tempsColl.Drop(ctx); err != nil {
-		return err
-	}
-
-	return b.chunksColl.Drop(ctx)
-}
-
-// Find returns the files collection documents that match the given filter.
-func (b *Bucket) Find(filter interface{}, opts ...*options.GridFSFindOptions) (*mongo.Cursor, error) {
-	ctx, cancel := deadlineContext(b.readDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-
-	gfsOpts := options.MergeGridFSFindOptions(opts...)
-	find := options.Find()
-	if gfsOpts.BatchSize != nil {
-		find.SetBatchSize(*gfsOpts.BatchSize)
-	}
-	if gfsOpts.Limit != nil {
-		find.SetLimit(int64(*gfsOpts.Limit))
-	}
-	if gfsOpts.MaxTime != nil {
-		find.SetMaxTime(*gfsOpts.MaxTime)
-	}
-	if gfsOpts.NoCursorTimeout != nil {
-		find.SetNoCursorTimeout(*gfsOpts.NoCursorTimeout)
-	}
-	if gfsOpts.Skip != nil {
-		find.SetSkip(int64(*gfsOpts.Skip))
-	}
-	if gfsOpts.Sort != nil {
-		find.SetSort(gfsOpts.Sort)
-	}
-
-	return b.filesColl.Find(ctx, filter, find)
+	openDeadline  time.Time
+	readDeadline  time.Time
+	writeDeadline time.Time
 }
 
 // SetOpenDeadline sets the open deadline for this bucket
@@ -253,32 +55,30 @@ func (b *Bucket) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (b *Bucket) openFile(ctx context.Context, fileInfo *FileInfo, flag int, perm os.FileMode) (*File, error) {
-	if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
-		_, err := b.filesColl.InsertOne(ctx, fileInfo)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		if fileInfo.ID != nil {
-			cursor, err := b.openByID(ctx, fileInfo.ID)
-			if err != nil {
-				return nil, err
-			}
-			if err := bson.Unmarshal(cursor.Current, &fileInfo); err != nil {
-				return nil, err
-			}
-		} else if fileInfo.Filename != "" {
-			cursor, err := b.openByFilename(ctx, fileInfo.Filename, fileInfo.Revision())
-			if err != nil {
-				return nil, err
-			}
-			if err := bson.Unmarshal(cursor.Current, &fileInfo); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return newFile(fileInfo, b.chunksColl, b.filesColl, b.tempsColl), nil
+// newFile returns a new File with the given file handle and name.
+func (b *Bucket) newFile(fileInfo *FileInfo, flag int) *File {
+	f := &File{&stream{
+		fileInfo:   fileInfo,
+		chunksColl: b.chunksColl,
+		filesColl:  b.filesColl,
+		tempsColl:  b.tempsColl,
+	}}
+	runtime.SetFinalizer(f.stream, (*stream).close)
+
+	// Ignore initialization errors.
+	// Assume any problems will show up in later I/O.
+	f.stream.init(StreamRead | StreamWrite)
+
+	return f
+}
+
+func (b *Bucket) openFile(name string, flag int, perm os.FileMode) (file *File, err error) {
+	panic("v")
+}
+
+// openFileNolog is the Unix implementation of OpenFile.
+func (b *Bucket) openFileNolog(name string, flag int, perm os.FileMode) (*File, error) {
+	panic("v")
 }
 
 func (b *Bucket) openByID(ctx context.Context, fileID interface{}) (*mongo.Cursor, error) {
@@ -441,31 +241,4 @@ func createIndexIfNotExists(ctx context.Context, iv mongo.IndexView, model mongo
 	}
 
 	return nil
-}
-
-type _convertFileID struct {
-	ID interface{} `bson:"_id"`
-}
-
-func convertFileID(fileID interface{}) (bsonx.Val, error) {
-	id := _convertFileID{
-		ID: fileID,
-	}
-
-	b, err := bson.Marshal(id)
-	if err != nil {
-		return bsonx.Val{}, err
-	}
-	val := bsoncore.Document(b).Lookup("_id")
-	var res bsonx.Val
-	err = res.UnmarshalBSONValue(val.Type, val.Data)
-	return res, err
-}
-
-func deadlineContext(deadline time.Time) (context.Context, context.CancelFunc) {
-	if deadline.Equal(time.Time{}) {
-		return context.Background(), nil
-	}
-
-	return context.WithDeadline(context.Background(), deadline)
 }

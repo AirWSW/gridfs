@@ -2,10 +2,10 @@ package gridfs
 
 import (
 	"context"
-	"errors"
 	"io"
 	"math"
-	"os"
+	"runtime"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -13,27 +13,39 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+)
+
+const (
+	// StreamClosed equal 1 if stream closed
+	StreamClosed uint8 = 1 << 0
+	// StreamRead equal 1 if stream can be read
+	StreamRead uint8 = 1 << 1
+	// StreamWrite equal 1 if stream can be wrote
+	StreamWrite uint8 = 1 << 2
+	// StreamModified equal 1 if stream buffer has been modified
+	StreamModified uint8 = 1 << 3
+
+	minStreamBufferLength int32 = 510 * 1024       // 510KiB
+	maxStreamBufferLength int32 = 32 * 1024 * 1024 // 32MiB
 )
 
 type stream struct {
-	closed    bool
-	offset    int64
+	mu        sync.Mutex
+	flag      uint8
 	numChunks int32
+	offset    int64
 
-	readExpectedChunk int32 // index of next expected chunk
-	readCursorChunk   int32
-	readCursor        *mongo.Cursor
-	readBuffer        []byte
-	readBufferStart   int
-	readBufferEnd     int
-	readDeadline      time.Time
+	buffer           []byte
+	bufferFilled     bool
+	bufferStart      int
+	bufferEnd        int
+	bufferStartChunk int32
+	bufferEndChunk   int32
+	expectedChunk    int32 // index of next expected chunk
 
-	writeStartChunk    int32
-	writeExpectedChunk int32
-	writeBuffer        []byte
-	writeBufferStart   int
-	writeBufferEnd     int
-	writeDeadline      time.Time
+	readDeadline  time.Time
+	writeDeadline time.Time
 
 	fileInfo   *FileInfo
 	chunksColl *mongo.Collection // The collection to store file chunks
@@ -41,93 +53,66 @@ type stream struct {
 	tempsColl  *mongo.Collection // The collection to store file temps.
 }
 
-func newStream(fileInfo *FileInfo, chunksColl, filesColl, tempsColl *mongo.Collection) *stream {
-	numChunks := int32(math.Ceil(float64(fileInfo.Length) / float64(fileInfo.ChunkSize)))
-
-	return &stream{
-		numChunks:       numChunks,
-		readCursorChunk: int32(-1),
-		fileInfo:        fileInfo,
-		chunksColl:      chunksColl,
-		filesColl:       filesColl,
-		tempsColl:       tempsColl,
+func (s *stream) init(flag uint8) {
+	s.flag = flag
+	s.numChunks = int32(math.Ceil(float64(s.fileInfo.Length) / float64(s.fileInfo.ChunkSize)))
+	bufferLength := s.fileInfo.ChunkSize * 8
+	if bufferLength < minStreamBufferLength {
+		bufferLength = minStreamBufferLength
+	} else if bufferLength > maxStreamBufferLength {
+		bufferLength = maxStreamBufferLength
 	}
-}
-
-// SetWriteDeadline sets the write deadline for this bucket.
-func (s *stream) setWriteDeadline(t time.Time) error {
-	if s.closed {
-		return ErrStreamClosed
-	}
-	s.writeDeadline = t
-	return nil
-}
-
-// SetReadDeadline sets the read deadline for this bucket
-func (s *stream) setReadDeadline(t time.Time) error {
-	if s.closed {
-		return ErrStreamClosed
-	}
-	s.readDeadline = t
-	return nil
+	s.buffer = make([]byte, bufferLength)
 }
 
 func (s *stream) close() error {
-	if s.closed {
+	if s == nil || s.flag&StreamClosed != 0 {
 		return ErrStreamClosed
 	}
 
-	ctx, cancel := deadlineContext(s.writeDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-	if s.writeBufferEnd != 0 {
-		if err := s.uploadChunks(ctx, true); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.flag&StreamModified != 0 {
+		ctx, cancel := deadlineContext(s.writeDeadline)
+		if cancel != nil {
+			defer cancel()
+		}
+		err := s.writeChunks(ctx, true)
+		if err != nil {
 			return err
 		}
 	}
-	if err := s.createFilesCollDoc(ctx); err != nil {
-		return err
-	}
+	s.flag = s.flag | StreamClosed
 
-	s.closed = true
+	// no need for a finalizer anymore
+	runtime.SetFinalizer(s, nil)
 	return nil
 }
 
 // read reads up to len(b) bytes from the File.
 // It returns the number of bytes read and an error, if any.
 func (s *stream) read(b []byte) (int, error) {
-	if s.closed {
-		return 0, ErrStreamClosed
+	if s.flag&StreamRead == 0 {
+		return 0, ErrStreamPermission
 	}
 
 	if s.offset == s.fileInfo.Length {
 		return 0, io.EOF
 	}
 
-	if s.readBuffer == nil {
-		s.readBuffer = make([]byte, DefaultReadBufferSize)
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	ctx, cancel := deadlineContext(s.readDeadline)
 	if cancel != nil {
 		defer cancel()
 	}
 
-	// if s.readCursorChunk == -1 || s.readCursorChunk != s.readExpectedChunk-1 {
-	// 	cursor, err := s.findChunks(ctx, s.fileInfo.ID, s.readExpectedChunk)
-	// 	if err != nil {
-	// 		return 0, err
-	// 	}
-	// 	s.readCursor = cursor
-	// }
-
 	bytesCopied := 0
-	var err error
 	for bytesCopied < len(b) {
-		if s.readBufferStart >= s.readBufferEnd {
-			// Buffer is empty and can load in data from new chunk.
-			err = s.fillBuffer(ctx)
+		if s.bufferStart >= s.bufferEnd {
+			err := s.readChunks(ctx)
 			if err != nil {
 				if err == errNoMoreChunks {
 					if bytesCopied == 0 {
@@ -137,13 +122,14 @@ func (s *stream) read(b []byte) (int, error) {
 				}
 				return bytesCopied, err
 			}
+		} else {
+			copied := copy(b[bytesCopied:], s.buffer[s.bufferStart:s.bufferEnd])
+
+			s.offset += int64(copied)
+			s.bufferStart += copied
+			s.bufferStartChunk = s.bufferEndChunk
+			bytesCopied += copied
 		}
-
-		copied := copy(b[bytesCopied:], s.readBuffer[s.readBufferStart:s.readBufferEnd])
-
-		s.offset += int64(copied)
-		s.readBufferStart += copied
-		bytesCopied += copied
 	}
 
 	return len(b), nil
@@ -151,10 +137,10 @@ func (s *stream) read(b []byte) (int, error) {
 
 // pread reads len(b) bytes from the File starting at byte offset off.
 // It returns the number of bytes read and the error, if any.
-// EOF is signaled by a zero count with err set to 0.
+// EOF is signaled by a zero count with err set to nil.
 func (s *stream) pread(b []byte, off int64) (int, error) {
-	if s.closed {
-		return 0, ErrStreamClosed
+	if s.flag&StreamRead == 0 {
+		return 0, ErrStreamPermission
 	}
 	_, err := s.seek(off, io.SeekStart)
 	if err != nil {
@@ -166,45 +152,44 @@ func (s *stream) pread(b []byte, off int64) (int, error) {
 // write writes len(b) bytes to the File.
 // It returns the number of bytes written and an error, if any.
 func (s *stream) write(b []byte) (int, error) {
-	if s.closed {
-		return 0, ErrStreamClosed
+	if s.flag&StreamWrite == 0 {
+		return 0, ErrStreamPermission
 	}
 
-	if s.writeBuffer == nil {
-		s.writeBuffer = make([]byte, DefaultWriteBufferSize)
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	ctx, cancel := deadlineContext(s.writeDeadline)
 	if cancel != nil {
 		defer cancel()
 	}
 
-	origLen := len(b)
-	for {
-		if len(b) == 0 {
-			break
-		}
-
-		n := copy(s.writeBuffer[s.writeBufferEnd:], b) // copy as much as possible
-		b = b[n:]
-		s.offset += int64(n)
-		s.writeBufferEnd += n
-
-		if s.writeBufferEnd == DefaultWriteBufferSize {
-			err := s.uploadChunks(ctx, false)
+	bytesCopied := len(b)
+	for len(b) != 0 {
+		if s.bufferEnd == len(s.buffer) {
+			err := s.writeChunks(ctx, false)
 			if err != nil {
 				return 0, err
 			}
+		} else {
+			copied := copy(s.buffer[s.bufferEnd:], b)
+			b = b[copied:]
+
+			s.offset += int64(copied)
+			s.bufferEnd += copied
+			s.flag = s.flag | StreamModified
+			bytesCopied += copied
 		}
 	}
-	return origLen, nil
+
+	return len(b), nil
 }
 
 // pwrite writes len(b) bytes to the File starting at byte offset off.
 // It returns the number of bytes written and an error, if any.
 func (s *stream) pwrite(b []byte, off int64) (int, error) {
-	if s.closed {
-		return 0, ErrStreamClosed
+	if s.flag&StreamWrite == 0 {
+		return 0, ErrStreamPermission
 	}
 	_, err := s.seek(off, io.SeekStart)
 	if err != nil {
@@ -218,50 +203,155 @@ func (s *stream) pwrite(b []byte, off int64) (int, error) {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (s *stream) seek(offset int64, whence int) (int64, error) {
-	if s.closed {
-		return 0, ErrStreamClosed
+	if s.flag&(StreamRead|StreamWrite) == 0 {
+		return 0, ErrStreamPermission
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.flag&StreamModified != 0 {
+		ctx, cancel := deadlineContext(s.writeDeadline)
+		if cancel != nil {
+			defer cancel()
+		}
+		err := s.writeChunks(ctx, true)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	switch whence {
 	case io.SeekStart:
-	case os.SEEK_CUR:
+	case io.SeekCurrent:
 		offset += s.offset
-	case os.SEEK_END:
+	case io.SeekEnd:
 		offset += s.fileInfo.Length
 	default:
-		return s.offset, errors.New("unsupported whence value")
+		return s.offset, ErrStreamSeekUnsupport
 	}
 
 	if offset > s.fileInfo.Length {
-		return s.offset, errors.New("seek past end of file")
+		return s.offset, ErrStreamSeekOverflow
 	}
 
 	s.offset = offset
-	expectedChunk := float64(offset) / float64(s.fileInfo.ChunkSize)
-
-	readExpectedChunk := int32(math.Floor(expectedChunk))
-	s.readBufferStart = int(offset) - int(readExpectedChunk)*int(s.fileInfo.ChunkSize)
-	if !(s.readCursorChunk == readExpectedChunk && s.readBufferEnd > s.readBufferStart) {
-		s.readExpectedChunk = readExpectedChunk
-		s.readBufferEnd = 0
+	expectedChunk := int32(math.Floor(float64(offset) / float64(s.fileInfo.ChunkSize)))
+	s.bufferStart = int(offset) - int(expectedChunk)*int(s.fileInfo.ChunkSize)
+	s.bufferStartChunk = expectedChunk
+	if !s.bufferFilled || !(s.bufferStartChunk == expectedChunk && s.bufferEnd > s.bufferStart) {
+		s.bufferFilled = false
+		s.bufferEnd = 0
+		s.bufferEndChunk = expectedChunk
+		s.expectedChunk = expectedChunk
 	}
-
-	s.writeStartChunk = readExpectedChunk
-	s.writeExpectedChunk = s.writeStartChunk
-	s.writeBufferStart = int(int32(math.Ceil(expectedChunk)))*int(s.fileInfo.ChunkSize) - int(offset)
-	s.writeBufferEnd = 0
 
 	return s.offset, nil
 }
 
-// uploadChunks uploads the current buffer as a series of chunks to the bucket
-// if uploadPartial is true, any data at the end of the buffer that is smaller than a chunk will be uploaded as a partial
+// setDeadline sets the read and write deadline.
+func (s *stream) setDeadline(t time.Time) error {
+	if s.flag&(StreamRead|StreamWrite) == 0 {
+		return ErrStreamPermission
+	}
+	s.readDeadline = t
+	s.writeDeadline = t
+	return nil
+}
+
+// setReadDeadline sets the read deadline.
+func (s *stream) setReadDeadline(t time.Time) error {
+	if s.flag&StreamRead == 0 {
+		return ErrStreamPermission
+	}
+	s.readDeadline = t
+	return nil
+}
+
+// setWriteDeadline sets the write deadline.
+func (s *stream) setWriteDeadline(t time.Time) error {
+	if s.flag&StreamWrite == 0 {
+		return ErrStreamPermission
+	}
+	s.writeDeadline = t
+	return nil
+}
+
+// readChunks read chunks from the bucket to the current buffer.
+// readChunks sets s.bufferEnd to the next available index in the buffer after read
+func (s *stream) readChunks(ctx context.Context) error {
+	if s.bufferFilled {
+		copy(s.buffer[0:], s.buffer[s.bufferStart:s.bufferEnd])
+		s.bufferStartChunk = s.bufferEndChunk
+		s.bufferEnd -= s.bufferStart
+		s.bufferStart = 0
+	}
+	chunks := math.Max(float64(len(s.buffer)-s.bufferEnd)/float64(s.fileInfo.ChunkSize), 0)
+	numChunks := int64(math.Floor(chunks))
+	maxChunks := int64(s.numChunks - s.bufferEndChunk)
+	if numChunks > maxChunks {
+		numChunks = maxChunks
+	}
+
+	if numChunks != 0 {
+		id, err := convertFileID(s.fileInfo.ID)
+		if err != nil {
+			return err
+		}
+		cursor, err := s.chunksColl.Find(ctx,
+			bson.M{"$and": bson.A{bson.M{"files_id": id}, bson.M{"n": bson.M{"$gte": s.expectedChunk}}}},
+			options.Find().SetLimit(numChunks).SetSort(bsonx.Doc{bsonx.Elem{Key: "n", Value: bsonx.Int32(1)}})) // sort by chunk index
+		if err != nil {
+			return err
+		}
+
+		for i := int64(0); i < numChunks; i++ {
+			if !cursor.Next(ctx) {
+				return errNoMoreChunks
+			}
+			chunkIndex, err := cursor.Current.LookupErr("n")
+			if err != nil {
+				return err
+			}
+			if chunkIndex.Int32() != s.expectedChunk {
+				return ErrWrongIndex
+			}
+			s.expectedChunk++
+			data, err := cursor.Current.LookupErr("data")
+			if err != nil {
+				return err
+			}
+			_, dataBytes := data.Binary()
+			copied := copy(s.buffer[s.bufferEnd:], dataBytes)
+			bytesLen := int32(len(dataBytes))
+			if s.expectedChunk == s.numChunks {
+				// final chunk can be fewer than s.chunkSize bytes
+				bytesDownloaded := int64(s.fileInfo.ChunkSize) * (int64(s.expectedChunk) - int64(1))
+				bytesRemaining := s.fileInfo.Length - int64(bytesDownloaded)
+
+				if int64(bytesLen) != bytesRemaining {
+					return ErrWrongSize
+				}
+			} else if bytesLen != s.fileInfo.ChunkSize {
+				// all intermediate chunks must have size s.chunkSize
+				return ErrWrongSize
+			}
+			s.bufferEnd += copied
+			s.bufferEndChunk = chunkIndex.Int32()
+		}
+	}
+	s.bufferFilled = true
+	return nil
+}
+
+// writeChunks uploads the current buffer as a series of chunks to the bucket.
+// if partial is true, any data at the end of the buffer that is smaller than a chunk will be wrote as a partial
 // chunk. if it is false, the data will be moved to the front of the buffer.
-// uploadChunks sets s.writeBufferEnd to the next available index in the buffer after uploading
-func (s *stream) uploadChunks(ctx context.Context, uploadPartial bool) error {
-	chunks := math.Max(float64(s.writeBufferEnd-s.writeBufferStart)/float64(s.fileInfo.ChunkSize), 0)
+// writeChunks sets s.bufferEnd to the next available index in the buffer after write
+func (s *stream) writeChunks(ctx context.Context, partial bool) error {
+	chunks := math.Max(float64(s.bufferEnd-s.bufferStart)/float64(s.fileInfo.ChunkSize), 0)
 	numChunks := int(math.Ceil(chunks))
-	if !uploadPartial {
+	if !partial {
 		numChunks = int(math.Floor(chunks))
 	}
 
@@ -273,24 +363,24 @@ func (s *stream) uploadChunks(ctx context.Context, uploadPartial bool) error {
 	if numChunks != 0 {
 		docs := make([]interface{}, int(numChunks))
 
-		begWriteExpectedChunk := s.writeExpectedChunk
-		for i := s.writeBufferStart; i < s.writeBufferEnd; i += int(s.fileInfo.ChunkSize) {
+		begExpectedChunk := s.expectedChunk
+		for i := s.bufferStart; i < s.bufferEnd; i += int(s.fileInfo.ChunkSize) {
 			endIndex := i + int(s.fileInfo.ChunkSize)
-			if s.writeBufferEnd-i < int(s.fileInfo.ChunkSize) {
+			if s.bufferEnd-i < int(s.fileInfo.ChunkSize) {
 				// partial chunk
-				if !uploadPartial {
+				if !partial {
 					break
 				}
-				endIndex = s.writeBufferEnd
+				endIndex = s.bufferEnd
 			}
-			chunkData := s.writeBuffer[i:endIndex]
-			docs[s.writeExpectedChunk-begWriteExpectedChunk] = bsonx.Doc{
+			chunkData := s.buffer[i:endIndex]
+			docs[s.expectedChunk-begExpectedChunk] = bsonx.Doc{
 				bsonx.Elem{Key: "_id", Value: bsonx.ObjectID(primitive.NewObjectID())},
 				bsonx.Elem{Key: "files_id", Value: id},
-				bsonx.Elem{Key: "n", Value: bsonx.Int32(int32(s.writeExpectedChunk))},
+				bsonx.Elem{Key: "n", Value: bsonx.Int32(int32(s.expectedChunk))},
 				bsonx.Elem{Key: "data", Value: bsonx.Binary(0x00, chunkData)},
 			}
-			s.writeExpectedChunk++
+			s.expectedChunk++
 			s.fileInfo.Length += int64(len(chunkData))
 		}
 
@@ -301,26 +391,26 @@ func (s *stream) uploadChunks(ctx context.Context, uploadPartial bool) error {
 
 		// copy any remaining bytes to beginning of buffer and set buffer index
 		bytesUploaded := numChunks * int(s.fileInfo.ChunkSize)
-		if bytesUploaded != DefaultWriteBufferSize && !uploadPartial {
-			copy(s.writeBuffer[s.writeBufferStart:], s.writeBuffer[s.writeBufferStart+bytesUploaded:s.writeBufferEnd])
+		if bytesUploaded != len(s.buffer) && !partial {
+			copy(s.buffer[s.bufferStart:], s.buffer[s.bufferStart+bytesUploaded:s.bufferEnd])
 		}
-		s.writeBufferEnd = s.writeBufferEnd - bytesUploaded
+		s.bufferEnd = s.bufferEnd - bytesUploaded
 	}
 
-	if s.writeBufferStart != 0 {
-		length := int32(s.writeBufferStart)
+	if s.bufferStart != 0 {
+		length := int32(s.bufferStart)
 		from := s.fileInfo.ChunkSize - length
 		to := s.fileInfo.ChunkSize
-		if s.writeBufferStart > s.writeBufferEnd {
-			length = int32(s.writeBufferEnd)
+		if s.bufferStart > s.bufferEnd {
+			length = int32(s.bufferEnd)
 			to = from + length
 		}
 
-		chunkData := s.writeBuffer[0:length]
+		chunkData := s.buffer[0:length]
 		doc := bsonx.Doc{
 			bsonx.Elem{Key: "_id", Value: bsonx.ObjectID(primitive.NewObjectID())},
 			bsonx.Elem{Key: "files_id", Value: id},
-			bsonx.Elem{Key: "n", Value: bsonx.Int32(s.writeStartChunk)},
+			bsonx.Elem{Key: "n", Value: bsonx.Int32(s.bufferStartChunk)},
 			bsonx.Elem{Key: "length", Value: bsonx.Int32(length)},
 			bsonx.Elem{Key: "from", Value: bsonx.Int32(from)},
 			bsonx.Elem{Key: "to", Value: bsonx.Int32(to)},
@@ -334,79 +424,16 @@ func (s *stream) uploadChunks(ctx context.Context, uploadPartial bool) error {
 			return err
 		}
 
-		copy(s.writeBuffer[0:], s.writeBuffer[s.writeBufferStart:s.writeBufferEnd])
-		s.readBufferStart = 0
-		s.writeBufferEnd = s.writeBufferEnd - s.readBufferStart
+		copy(s.buffer[0:], s.buffer[s.bufferStart:s.bufferEnd])
+		s.bufferEnd = s.bufferEnd - s.bufferStart
+		s.bufferStart = 0
 	}
 
+	s.bufferEndChunk = int32(math.Floor(float64(s.offset) / float64(s.fileInfo.ChunkSize)))
+	s.bufferStartChunk = s.bufferEndChunk
+
+	s.flag = s.flag & ^StreamModified
 	return nil
-}
-
-func (s *stream) fillBuffer(ctx context.Context) error {
-	cursor, err := s.findChunks(ctx, s.fileInfo.ID, s.readExpectedChunk)
-	if err != nil {
-		return err
-	}
-	s.readCursor = cursor
-
-	if !s.readCursor.Next(ctx) {
-		return errNoMoreChunks
-	}
-
-	chunkIndex, err := s.readCursor.Current.LookupErr("n")
-	if err != nil {
-		return err
-	}
-
-	if chunkIndex.Int32() != s.readExpectedChunk {
-		return ErrWrongIndex
-	}
-
-	s.readExpectedChunk++
-	data, err := s.readCursor.Current.LookupErr("data")
-	if err != nil {
-		return err
-	}
-
-	_, dataBytes := data.Binary()
-	copied := copy(s.readBuffer, dataBytes)
-
-	bytesLen := int32(len(dataBytes))
-	if s.readExpectedChunk == s.numChunks {
-		// final chunk can be fewer than s.chunkSize bytes
-		bytesDownloaded := int64(s.fileInfo.ChunkSize) * (int64(s.readExpectedChunk) - int64(1))
-		bytesRemaining := s.fileInfo.Length - int64(bytesDownloaded)
-
-		if int64(bytesLen) != bytesRemaining {
-			return ErrWrongSize
-		}
-	} else if bytesLen != s.fileInfo.ChunkSize {
-		// all intermediate chunks must have size s.chunkSize
-		return ErrWrongSize
-	}
-
-	if s.readCursorChunk != -1 && s.readCursorChunk != chunkIndex.Int32() {
-		s.readBufferStart = 0
-	}
-	s.readCursorChunk = chunkIndex.Int32()
-	s.readBufferEnd = copied
-
-	return nil
-}
-
-func (s *stream) findChunks(ctx context.Context, fileID interface{}, n int32) (*mongo.Cursor, error) {
-	id, err := convertFileID(fileID)
-	if err != nil {
-		return nil, err
-	}
-	chunksCursor, err := s.chunksColl.Find(ctx,
-		bson.M{"$and": bson.A{bson.M{"files_id": id}, bson.M{"n": n}}},
-		options.Find().SetSort(bsonx.Doc{bsonx.Elem{Key: "n", Value: bsonx.Int32(1)}})) // sort by chunk index
-	if err != nil {
-		return nil, err
-	}
-
-	return chunksCursor, nil
 }
 
 func (s *stream) createFilesCollDoc(ctx context.Context) error {
@@ -424,18 +451,57 @@ func (s *stream) createFilesCollDoc(ctx context.Context) error {
 	}
 
 	if s.fileInfo.Metadata != nil {
-		doc = append(doc, bsonx.Elem{Key: "metadata", Value: bsonx.Document(s.fileInfo.Metadata)})
+		metadataRaw, err := bson.Marshal(s.fileInfo.Metadata)
+		if err != nil {
+			return err
+		}
+		metadataDoc, err := bsonx.ReadDoc(metadataRaw)
+		if err != nil {
+			return err
+		}
+		doc = append(doc, bsonx.Elem{Key: "metadata", Value: bsonx.Document(metadataDoc)})
 	}
 
 	if s.fileInfo.Reference != nil {
-		doc = append(doc, bsonx.Elem{Key: "reference", Value: bsonx.Document(s.fileInfo.Reference)})
+		referenceRaw, err := bson.Marshal(s.fileInfo.Reference)
+		if err != nil {
+			return err
+		}
+		referenceDoc, err := bsonx.ReadDoc(referenceRaw)
+		if err != nil {
+			return err
+		}
+		doc = append(doc, bsonx.Elem{Key: "reference", Value: bsonx.Document(referenceDoc)})
 	}
 
 	_ = s.filesColl.FindOneAndReplace(ctx, bsonx.Doc{bsonx.Elem{Key: "_id", Value: id}}, doc)
-	// _, err = s.filesColl.InsertOne(ctx, doc)
-	// if err != nil {
-	// 	return err
-	// }
 
 	return nil
+}
+
+type _convertFileID struct {
+	ID interface{} `bson:"_id"`
+}
+
+func convertFileID(fileID interface{}) (bsonx.Val, error) {
+	id := _convertFileID{
+		ID: fileID,
+	}
+
+	b, err := bson.Marshal(id)
+	if err != nil {
+		return bsonx.Val{}, err
+	}
+	val := bsoncore.Document(b).Lookup("_id")
+	var res bsonx.Val
+	err = res.UnmarshalBSONValue(val.Type, val.Data)
+	return res, err
+}
+
+func deadlineContext(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.Equal(time.Time{}) {
+		return context.Background(), nil
+	}
+
+	return context.WithDeadline(context.Background(), deadline)
 }
