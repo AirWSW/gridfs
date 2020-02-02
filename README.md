@@ -1,1 +1,3 @@
-# gridfs
+# GridFS
+
+Advanced GridFS driver.
