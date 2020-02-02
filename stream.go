@@ -47,8 +47,6 @@ func newStream(fileInfo *FileInfo, chunksColl, filesColl, tempsColl *mongo.Colle
 	return &stream{
 		numChunks:       numChunks,
 		readCursorChunk: int32(-1),
-		readBuffer:      make([]byte, DefaultReadBufferSize),
-		writeBuffer:     make([]byte, DefaultWriteBufferSize),
 		fileInfo:        fileInfo,
 		chunksColl:      chunksColl,
 		filesColl:       filesColl,
@@ -107,18 +105,22 @@ func (s *stream) read(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 
+	if s.readBuffer == nil {
+		s.readBuffer = make([]byte, DefaultReadBufferSize)
+	}
+
 	ctx, cancel := deadlineContext(s.readDeadline)
 	if cancel != nil {
 		defer cancel()
 	}
 
-	if s.readCursorChunk == -1 || s.readCursorChunk != s.readExpectedChunk-1 {
-		cursor, err := s.findChunks(ctx, s.fileInfo.ID, s.readExpectedChunk)
-		if err != nil {
-			return 0, err
-		}
-		s.readCursor = cursor
-	}
+	// if s.readCursorChunk == -1 || s.readCursorChunk != s.readExpectedChunk-1 {
+	// 	cursor, err := s.findChunks(ctx, s.fileInfo.ID, s.readExpectedChunk)
+	// 	if err != nil {
+	// 		return 0, err
+	// 	}
+	// 	s.readCursor = cursor
+	// }
 
 	bytesCopied := 0
 	var err error
@@ -166,6 +168,10 @@ func (s *stream) pread(b []byte, off int64) (int, error) {
 func (s *stream) write(b []byte) (int, error) {
 	if s.closed {
 		return 0, ErrStreamClosed
+	}
+
+	if s.writeBuffer == nil {
+		s.writeBuffer = make([]byte, DefaultWriteBufferSize)
 	}
 
 	ctx, cancel := deadlineContext(s.writeDeadline)
@@ -337,6 +343,12 @@ func (s *stream) uploadChunks(ctx context.Context, uploadPartial bool) error {
 }
 
 func (s *stream) fillBuffer(ctx context.Context) error {
+	cursor, err := s.findChunks(ctx, s.fileInfo.ID, s.readExpectedChunk)
+	if err != nil {
+		return err
+	}
+	s.readCursor = cursor
+
 	if !s.readCursor.Next(ctx) {
 		return errNoMoreChunks
 	}
@@ -388,7 +400,7 @@ func (s *stream) findChunks(ctx context.Context, fileID interface{}, n int32) (*
 		return nil, err
 	}
 	chunksCursor, err := s.chunksColl.Find(ctx,
-		bson.M{"$and": bson.A{bson.M{"files_id": id}, bson.M{"n": bson.M{"$gte": n}}}},
+		bson.M{"$and": bson.A{bson.M{"files_id": id}, bson.M{"n": n}}},
 		options.Find().SetSort(bsonx.Doc{bsonx.Elem{Key: "n", Value: bsonx.Int32(1)}})) // sort by chunk index
 	if err != nil {
 		return nil, err

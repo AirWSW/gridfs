@@ -60,5 +60,5 @@ const (
 	// DefaultReadBufferSize is the default size of each file chunk.
 	DefaultReadBufferSize int = 255 * 1024 // 255KiB
 	// DefaultWriteBufferSize is the default size of each file chunk.
-	DefaultWriteBufferSize int = 4 * 1024 * 1024 // 4MiB
+	DefaultWriteBufferSize int = 512 * 1024 // 512KiB
 )
