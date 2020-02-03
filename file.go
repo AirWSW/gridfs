@@ -3,12 +3,15 @@ package gridfs
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"io"
-	"log"
 	"math"
 	"os"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/x/bsonx"
 )
 
 // File represents an open file descriptor.
@@ -48,16 +51,59 @@ type Hashes struct {
 	QuickXorHash *string `bson:"quickXorHash,omitempty"` // base64
 }
 
-func (f *File) MD5Hash() (md5Hash *string, err error) {
-	if err := f.checkValid("MD5Hash"); err != nil {
+func (fileInfo *FileInfo) FileID() (bsonx.Val, error) {
+	return convertFileID(fileInfo.ID)
+}
+
+func (fileInfo *FileInfo) Doc() (*bsonx.Doc, error) {
+	id, err := fileInfo.FileID()
+	if err != nil {
 		return nil, err
 	}
-	if f.stream.fileInfo.Reference != nil {
-		md5Hash = f.stream.fileInfo.Reference.Hashes.MD5Hash
-	} else {
+	doc := bsonx.Doc{
+		bsonx.Elem{Key: "_id", Value: id},
+		bsonx.Elem{Key: "length", Value: bsonx.Int64(fileInfo.Length)},
+		bsonx.Elem{Key: "chunkSize", Value: bsonx.Int32(fileInfo.ChunkSize)},
+		bsonx.Elem{Key: "uploadDate", Value: bsonx.DateTime(time.Now().UnixNano() / int64(time.Millisecond))},
+		bsonx.Elem{Key: "filename", Value: bsonx.String(fileInfo.Filename)},
+	}
+	if fileInfo.Metadata != nil {
+		metadataRaw, err := bson.Marshal(fileInfo.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		metadataDoc, err := bsonx.ReadDoc(metadataRaw)
+		if err != nil {
+			return nil, err
+		}
+		doc = append(doc, bsonx.Elem{Key: "metadata", Value: bsonx.Document(metadataDoc)})
+	}
+	if fileInfo.Reference != nil {
+		referenceRaw, err := bson.Marshal(fileInfo.Reference)
+		if err != nil {
+			return nil, err
+		}
+		referenceDoc, err := bsonx.ReadDoc(referenceRaw)
+		if err != nil {
+			return nil, err
+		}
+		doc = append(doc, bsonx.Elem{Key: "reference", Value: bsonx.Document(referenceDoc)})
+	}
+	return &doc, nil
+}
+
+func (f *File) Name() (name string) {
+	return f.stream.fileInfo.Filename
+}
+
+func (f *File) MD5Hash() (md5Hash string, err error) {
+	if err := f.checkValid("MD5Hash"); err != nil {
+		return "", err
+	}
+	if f.stream.fileInfo.Reference == nil {
 		f.stream.fileInfo.Reference = &FileReference{Hashes: Hashes{}}
 	}
-	if md5Hash == nil {
+	if pMD5Hash := f.stream.fileInfo.Reference.Hashes.MD5Hash; pMD5Hash == nil {
 		_, err = f.Seek(0, io.SeekStart)
 		if err != nil {
 			return
@@ -65,15 +111,22 @@ func (f *File) MD5Hash() (md5Hash *string, err error) {
 		f.stream.numChunks = int32(math.Ceil(float64(f.stream.fileInfo.Length) / float64(f.stream.fileInfo.ChunkSize)))
 		r := bufio.NewReader(f)
 		h := md5.New()
-		if _, err := io.Copy(h, r); err != nil {
-			log.Println(err)
+		_, err = io.Copy(h, r)
+		if err != nil {
+			return
 		}
-		hSum := string(h.Sum(nil))
-		f.stream.fileInfo.Reference.Hashes.MD5Hash = &hSum
-		log.Printf("%x %s", md5Hash, f.fileInfo.Filename)
-	}
-	if e := f.stream.close(); e != nil {
-		err = f.wrapErr("close", e)
+		md5Hash = hex.EncodeToString(h.Sum(nil))
+		f.stream.fileInfo.Reference.Hashes.MD5Hash = &md5Hash
+		ctx, cancel := deadlineContext(f.stream.writeDeadline)
+		if cancel != nil {
+			defer cancel()
+		}
+		err = f.stream.updateFilesCollDoc(ctx)
+		if err != nil {
+			return
+		}
+	} else {
+		md5Hash = *pMD5Hash
 	}
 	return
 }
@@ -84,20 +137,6 @@ func (f *File) MD5Hash() (md5Hash *string, err error) {
 // Close will return an error if it has already been called.
 func (f *File) Close() (err error) {
 	if err := f.checkValid("Close"); err != nil {
-		return err
-	}
-	ctx, cancel := deadlineContext(f.stream.writeDeadline)
-	if cancel != nil {
-		defer cancel()
-	}
-	if f.stream.flag&StreamModified != 0 {
-		err := f.stream.writeChunks(ctx, true)
-		if err != nil {
-			return err
-		}
-		f.stream.flag = f.stream.flag &^ StreamModified
-	}
-	if err := f.stream.createFilesCollDoc(ctx); err != nil {
 		return err
 	}
 	if e := f.stream.close(); e != nil {

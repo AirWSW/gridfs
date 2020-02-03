@@ -17,14 +17,16 @@ import (
 )
 
 const (
+	// StreamCreated equal 1 if stream buffer has been modified
+	StreamCreated uint8 = 1 << 0
 	// StreamClosed equal 1 if stream closed
-	StreamClosed uint8 = 1 << 0
+	StreamClosed uint8 = 1 << 1
 	// StreamRead equal 1 if stream can be read
-	StreamRead uint8 = 1 << 1
+	StreamRead uint8 = 1 << 2
 	// StreamWrite equal 1 if stream can be wrote
-	StreamWrite uint8 = 1 << 2
+	StreamWrite uint8 = 1 << 3
 	// StreamModified equal 1 if stream buffer has been modified
-	StreamModified uint8 = 1 << 3
+	StreamModified uint8 = 1 << 4
 
 	minStreamBufferLength int32 = 510 * 1024       // 510KiB
 	maxStreamBufferLength int32 = 32 * 1024 * 1024 // 32MiB
@@ -63,6 +65,13 @@ func (s *stream) init(flag uint8) {
 		bufferLength = maxStreamBufferLength
 	}
 	s.buffer = make([]byte, bufferLength)
+	ctx, cancel := deadlineContext(s.writeDeadline)
+	if cancel != nil {
+		defer cancel()
+	}
+	if s.flag&StreamCreated == 0 {
+		s.createFilesCollDoc(ctx)
+	}
 }
 
 func (s *stream) close() error {
@@ -82,6 +91,10 @@ func (s *stream) close() error {
 		if err != nil {
 			return err
 		}
+		if err := s.updateFilesCollDoc(ctx); err != nil {
+			return err
+		}
+		s.flag = s.flag &^ StreamModified
 	}
 	s.flag = s.flag | StreamClosed
 
@@ -164,7 +177,7 @@ func (s *stream) write(b []byte) (int, error) {
 		defer cancel()
 	}
 
-	bytesCopied := len(b)
+	bytesCopied := 0
 	for len(b) != 0 {
 		if s.bufferEnd == len(s.buffer) {
 			err := s.writeChunks(ctx, false)
@@ -182,7 +195,7 @@ func (s *stream) write(b []byte) (int, error) {
 		}
 	}
 
-	return len(b), nil
+	return bytesCopied, nil
 }
 
 // pwrite writes len(b) bytes to the File starting at byte offset off.
@@ -437,45 +450,30 @@ func (s *stream) writeChunks(ctx context.Context, partial bool) error {
 }
 
 func (s *stream) createFilesCollDoc(ctx context.Context) error {
-	id, err := convertFileID(s.fileInfo.ID)
+	doc, err := s.fileInfo.Doc()
 	if err != nil {
 		return err
 	}
-
-	doc := bsonx.Doc{
-		bsonx.Elem{Key: "_id", Value: id},
-		bsonx.Elem{Key: "length", Value: bsonx.Int64(s.fileInfo.Length)},
-		bsonx.Elem{Key: "chunkSize", Value: bsonx.Int32(s.fileInfo.ChunkSize)},
-		bsonx.Elem{Key: "uploadDate", Value: bsonx.DateTime(time.Now().UnixNano() / int64(time.Millisecond))},
-		bsonx.Elem{Key: "filename", Value: bsonx.String(s.fileInfo.Filename)},
+	_, err = s.filesColl.InsertOne(ctx, doc)
+	if err != nil {
+		return err
 	}
+	return nil
+}
 
-	if s.fileInfo.Metadata != nil {
-		metadataRaw, err := bson.Marshal(s.fileInfo.Metadata)
-		if err != nil {
-			return err
-		}
-		metadataDoc, err := bsonx.ReadDoc(metadataRaw)
-		if err != nil {
-			return err
-		}
-		doc = append(doc, bsonx.Elem{Key: "metadata", Value: bsonx.Document(metadataDoc)})
+func (s *stream) updateFilesCollDoc(ctx context.Context) error {
+	id, err := s.fileInfo.FileID()
+	if err != nil {
+		return err
 	}
-
-	if s.fileInfo.Reference != nil {
-		referenceRaw, err := bson.Marshal(s.fileInfo.Reference)
-		if err != nil {
-			return err
-		}
-		referenceDoc, err := bsonx.ReadDoc(referenceRaw)
-		if err != nil {
-			return err
-		}
-		doc = append(doc, bsonx.Elem{Key: "reference", Value: bsonx.Document(referenceDoc)})
+	doc, err := s.fileInfo.Doc()
+	if err != nil {
+		return err
 	}
-
-	_ = s.filesColl.FindOneAndReplace(ctx, bsonx.Doc{bsonx.Elem{Key: "_id", Value: id}}, doc)
-
+	singleResult := s.filesColl.FindOneAndReplace(ctx, bsonx.Doc{bsonx.Elem{Key: "_id", Value: id}}, doc)
+	if err := singleResult.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
